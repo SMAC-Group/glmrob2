@@ -170,6 +170,14 @@ glmrob2.fit <- function (x, y, weights = rep(1, nobs), start = NULL,
   unless.null <- function(x, if.null) if(is.null(x)) if.null else x
   valideta <- unless.null(family$valideta, function(eta) TRUE)
   validmu  <- unless.null(family$validmu,  function(mu) TRUE)
+
+  ## starting values
+  if(is.null(start))
+    start <- glm.fit(x = x, y = y, weights = weights, offset = offset,
+                     family = family)$coefficients
+  etastart <- drop(x %*% start)
+  mustart <- linkinv(eta <- etastart + offset)
+
   if(is.null(mustart)) {
     ## calculates mustart and may change y and weights and set n (!)
     eval(family$initialize)
@@ -284,7 +292,7 @@ glmrob2.fit <- function (x, y, weights = rep(1, nobs), start = NULL,
       phi <- 1 # TODO: estimate phi (for more families)
       ## see for e.g., section 5.3.3 of Robust Methods in Biostatistics (2009).
       varmu <- variance(mu)[good]
-      mu.eta.val <- mu.eta(eta)[good]
+      mu.eta.val <- mu.eta(eta)[good] # 1 / g'(mu)
       r <- (y - mu)[good] / sqrt(varmu) # Pearson's residuals
       psi <- .Call(C_psifun, r, c.psi, ipsi, 0L) # psi function evaluated on residuals
       psip <- .Call(C_psifun, r, c.psi, ipsi, 1L) # 1st derivative of psi function evaluated on residuals
@@ -294,8 +302,11 @@ glmrob2.fit <- function (x, y, weights = rep(1, nobs), start = NULL,
       alpha <- psi * (varmup / sqrt(phi * varmu) / 2 + sqrt(varmu) * g2.val * mu.eta.val) + psip * (1 / sqrt(phi) + r * varmup / sqrt(varmu) / 2)
       z <- psi * sqrt(varmu) / sqrt(phi) / mu.eta.val / alpha + eta[good]
       w <- mu.eta.val^2 * alpha / varmu
+      ytilde <- psi / sqrt(varmu) / sqrt(phi) * mu.eta.val
 
       #### End modification
+      # FIXME: choose the right algorithm
+      ## GLM-style:
       ngoodobs <- as.integer(nobs - sum(!good))
       ## call Fortran code via C wrapper
       fit <- .Call(C_Cdqrls, x[good, , drop = FALSE] * w, z * w,
@@ -305,12 +316,20 @@ glmrob2.fit <- function (x, y, weights = rep(1, nobs), start = NULL,
         warning(gettextf("non-finite coefficients at iteration %d", iter), domain = NA)
         break
       }
-      ## stop if not enough parameters
+      # stop if not enough parameters
       if (nobs < fit$rank)
         stop(sprintf(ngettext(nobs,
                               "X matrix has rank %d, but only %d observation",
                               "X matrix has rank %d, but only %d observations"),
                      fit$rank, nobs), domain = NA)
+      ## GLMROB-style:
+      Dtheta <- solve(crossprod(x, diag(w) %*% x), crossprod(x, ytilde))
+      if (any(!is.finite(Dtheta))) {
+        warning("Non-finite coefficients at iteration ", iter)
+        break
+      }
+      fit$coefficients <- coefold + Dtheta
+
       ## calculate updated values of eta and mu with the new coef:
       start[fit$pivot] <- fit$coefficients
       eta <- drop(x %*% start)
@@ -390,17 +409,17 @@ glmrob2.fit <- function (x, y, weights = rep(1, nobs), start = NULL,
     } ##-------------- end IRLS iteration -------------------------------
 
     if (!conv)
-      warning("glm.fit: algorithm did not converge", call. = FALSE)
+      warning("glmrob2.fit: algorithm did not converge", call. = FALSE)
     if (boundary)
-      warning("glm.fit: algorithm stopped at boundary value", call. = FALSE)
+      warning("glmrob2.fit: algorithm stopped at boundary value", call. = FALSE)
     eps <- 10*.Machine$double.eps
     if (family$family == "binomial") {
       if (any(mu > 1 - eps) || any(mu < eps))
-        warning("glm.fit: fitted probabilities numerically 0 or 1 occurred", call. = FALSE)
+        warning("glmrob2.fit: fitted probabilities numerically 0 or 1 occurred", call. = FALSE)
     }
     if (family$family == "poisson") {
       if (any(mu < eps))
-        warning("glm.fit: fitted rates numerically 0 occurred", call. = FALSE)
+        warning("glmrob2.fit: fitted rates numerically 0 occurred", call. = FALSE)
     }
     ## If X matrix was not full rank then columns were pivoted,
     ## hence we need to re-label the names ...
@@ -484,7 +503,7 @@ glmrob2.control <-
     # robust functions
     .Mpsi.tuning.default <- getFromNamespace(".Mpsi.tuning.default", ns = "robustbase")
     .regularize.Mpsi <- getFromNamespace(".regularize.Mpsi", ns = "robustbase")
-    psi <- .regularize.Mpsi(psi)
+    if(psi!="huber") psi <- .regularize.Mpsi(psi)
     if(is.null(tuning.psi))
       tuning.psi <- .Mpsi.tuning.default(psi)
     list(acc = acc, test.acc = test.acc, maxit = maxit, tuning.psi = tuning.psi, psi = psi, epsilon = epsilon, trace = trace)
